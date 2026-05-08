@@ -624,7 +624,7 @@
       <p class="hint" id="strategy-hint" style="margin-top:10px;"></p>
     </div>
 
-    <button id="start-game" class="primary big">Start Game →</button>
+    <button id="start-game" class="primary big">Continue →</button>
     <button id="reset-all" class="big" style="background:transparent; color:var(--text-dim); border:none; margin-top:0;">Reset everything</button>
   </div>
 
@@ -709,6 +709,7 @@
   <div class="modal-card">
     <h2 id="end-title">Half Time</h2>
     <p id="end-sub" style="color:var(--text-dim); margin-top:0;"></p>
+    <div id="end-lineup" style="display:none; margin-bottom:16px;"></div>
     <div id="end-stats"></div>
     <div class="row" style="margin-top:14px;">
       <button id="end-secondary"></button>
@@ -903,22 +904,24 @@ function tick() {
   const warnSeconds = Math.min(SUB_WARN_SECONDS, S.subInterval * 60 * 0.4);
   // Sound fires 30s before (or 15% of interval if shorter)
   const soundSeconds = Math.min(30, S.subInterval * 60 * 0.15);
+  // Half-time transition is handled by handleHalfEnd — skip sub alerts for that slot
+  const isHalfTimeSub = S.game.nextSubAt > S.halfLength * 60;
 
   // Sound alert — fires once per sub slot, before the sub is due
-  if (subSoundFiredFor !== S.game.nextSubAt && tilSub <= soundSeconds && tilSub > 0) {
+  if (!isHalfTimeSub && subSoundFiredFor !== S.game.nextSubAt && tilSub <= soundSeconds && tilSub > 0) {
     subSoundFiredFor = S.game.nextSubAt;
     notifySub();
   }
 
   // Early warning — open modal before sub is due (no pause)
-  if (!subModalOpen && subWarnFiredFor !== S.game.nextSubAt &&
+  if (!isHalfTimeSub && !subModalOpen && subWarnFiredFor !== S.game.nextSubAt &&
       tilSub <= warnSeconds && tilSub > 0 && timeIntoInterval >= 30) {
     subWarnFiredFor = S.game.nextSubAt;
     triggerSub();
   }
 
   // Fallback — open modal at actual sub time if it wasn't opened early or was closed
-  if (!subModalOpen && subActualFiredFor !== S.game.nextSubAt && tilSub <= 0) {
+  if (!isHalfTimeSub && !subModalOpen && subActualFiredFor !== S.game.nextSubAt && tilSub <= 0) {
     subActualFiredFor = S.game.nextSubAt;
     triggerSub();
   }
@@ -949,10 +952,17 @@ function handleHalfEnd() {
   subWarnFiredFor = -1;
   subActualFiredFor = -1;
   if (S.game.half === 1) {
+    // Compute 2nd half lineup before advancing state
+    pendingSwaps = suggestSubs();
+    pendingNewGk = pendingSwaps.newGkId;
+
     S.game.half = 2;
     S.game.halfElapsed = 0;
     S.game.nextSubAt = S.subInterval * 60;
-    showEndModal('Half Time', 'Take a breath. Resume when ready.', 'Resume 2nd half', 'Stay paused', () => {
+
+    renderHalfTimeLineup();
+    showEndModal('⏸ Half Time', 'Here\'s the lineup for 2nd half.', 'Resume 2nd half', 'Stay paused', () => {
+      applyHalfTimeSwaps();
       startTimer();
     });
   } else {
@@ -964,6 +974,46 @@ function handleHalfEnd() {
   }
   saveState();
   render();
+}
+
+function renderHalfTimeLineup() {
+  if (!pendingSwaps) return;
+  const onFieldAfter = new Set([...S.game.onFieldIds]);
+  pendingSwaps.forEach(s => { onFieldAfter.delete(s.outId); onFieldAfter.add(s.inId); });
+  const roster = S.game.roster;
+  const field = roster.filter(p => onFieldAfter.has(p.id));
+  const bench = roster.filter(p => !onFieldAfter.has(p.id));
+  const newGkId = pendingNewGk;
+
+  function pill(p) {
+    const isGk = p.id === newGkId;
+    return `<span style="display:inline-flex;align-items:center;gap:4px;background:${isGk ? 'rgba(245,158,11,0.15)' : 'rgba(255,255,255,0.06)'};border:1px solid ${isGk ? 'var(--orange)' : 'var(--border)'};border-radius:20px;padding:4px 10px;font-size:13px;">${isGk ? '🥅 ' : ''}${escapeHtml(p.name)}</span>`;
+  }
+
+  const lineupEl = document.getElementById('end-lineup');
+  lineupEl.innerHTML = `
+    <div style="font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--text-dim);margin-bottom:6px;">On the pitch</div>
+    <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px;">${field.map(pill).join('')}</div>
+    ${bench.length > 0 ? `<div style="font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--text-dim);margin-bottom:6px;">On the bench</div>
+    <div style="display:flex;flex-wrap:wrap;gap:6px;">${bench.map(pill).join('')}</div>` : ''}
+  `;
+  lineupEl.style.display = '';
+}
+
+function applyHalfTimeSwaps() {
+  if (!pendingSwaps) return;
+  for (const s of pendingSwaps) {
+    const idx = S.game.onFieldIds.indexOf(s.outId);
+    if (idx >= 0) S.game.onFieldIds[idx] = s.inId;
+  }
+  if (S.gkMode === 'rotate' && pendingNewGk) {
+    S.game.gkId = pendingNewGk;
+  } else if (S.gkMode === 'fixed') {
+    S.game.gkId = S.fixedGkId;
+  }
+  pendingSwaps = null;
+  pendingNewGk = null;
+  saveState();
 }
 
 // ============================================================
@@ -982,10 +1032,9 @@ function suggestSubs() {
   const swaps = [];
 
   if (S.gkMode === 'rotate' && bench.length > 0) {
-    // GK always comes off via a real substitution; bench player with least GK time takes over
+    // GK always comes off via a real substitution
     const newGkPlayer = bench.slice().sort((a, b) => a.gkSeconds - b.gkSeconds)[0];
     swaps.push({ outId: gkId, inId: newGkPlayer.id });
-    swaps.newGkId = newGkPlayer.id;
 
     // Fill remaining swap slots with normal fairness logic, excluding the forced GK pair
     const remainingOut = fielders.filter(p => p.id !== gkId)
@@ -995,6 +1044,15 @@ function suggestSubs() {
     for (let i = 0; i < additionalCount; i++) {
       swaps.push({ outId: remainingOut[i].id, inId: remainingBench[i].id });
     }
+
+    // New GK: whoever on field after all swaps has least GK time.
+    // With multiple bench players this is typically the incoming player; with only 1 bench
+    // player it rotates GK through all outfield players rather than looping between two.
+    const onFieldAfter = new Set([...game.onFieldIds]);
+    swaps.forEach(s => { onFieldAfter.delete(s.outId); onFieldAfter.add(s.inId); });
+    const gkCandidates = present.filter(p => onFieldAfter.has(p.id))
+                                 .sort((a, b) => a.gkSeconds - b.gkSeconds);
+    swaps.newGkId = gkCandidates[0]?.id || gkId;
   } else {
     // Fixed GK (excluded from swaps) or no GK mode; standard fairness rotation
     let outCandidates = fielders.slice();
@@ -2045,6 +2103,8 @@ function choosePicker(id) {
 function showEndModal(title, sub, primaryLabel, secondaryLabel, primaryFn, secondaryFn) {
   document.getElementById('end-title').textContent = title;
   document.getElementById('end-sub').textContent = sub;
+  document.getElementById('end-lineup').style.display = 'none';
+  document.getElementById('end-lineup').innerHTML = '';
   renderStatsInto(document.getElementById('end-stats'));
   document.getElementById('end-primary').textContent = primaryLabel;
   document.getElementById('end-secondary').textContent = secondaryLabel;
